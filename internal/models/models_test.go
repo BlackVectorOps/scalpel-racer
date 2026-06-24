@@ -4,6 +4,7 @@ package models_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -11,6 +12,19 @@ import (
 
 	"github.com/xkilldash9x/scalpel-racer/internal/models"
 )
+
+func TestScanResult_JSONIncludesErrorMessage(t *testing.T) {
+	r := models.NewScanResult(1, 0, 0, nil, errors.New("boom"))
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The error interface marshals to {}; the message must be carried in a
+	// string field instead so reports actually contain it.
+	if !strings.Contains(string(b), `"error":"boom"`) {
+		t.Errorf("JSON should carry the error message, got: %s", b)
+	}
+}
 
 func TestCapturedRequest_Clone(t *testing.T) {
 	original := &models.CapturedRequest{

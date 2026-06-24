@@ -51,7 +51,8 @@ type ScanResult struct {
 	BodyHash    string            `json:"body_hash"`
 	BodySnippet string            `json:"body_snippet"`
 	Body        []byte            `json:"-"` // Exclude raw body from JSON summary
-	Error       error             `json:"error,omitempty"`
+	Error       error             `json:"-"` // interface; marshals to {}, so excluded -- see ErrorMsg
+	ErrorMsg    string            `json:"error,omitempty"`
 	Meta        map[string]string `json:"meta,omitempty"`
 }
 
@@ -63,6 +64,9 @@ func NewScanResult(index int, statusCode int, duration time.Duration, body []byt
 		Error:      err,
 		Body:       body,
 		Meta:       make(map[string]string),
+	}
+	if err != nil {
+		r.ErrorMsg = err.Error()
 	}
 
 	if err == nil && len(body) > 0 {
