@@ -128,16 +128,42 @@ type StartTeeReadCloser struct {
 	io.Closer
 }
 
+// CaptureBuffer is a goroutine-safe byte buffer for request capture. With HTTP/2
+// or HTTP/3 upstreams the transport keeps writing the tee'd request body from a
+// separate goroutine after Do() returns, while the caller reads the capture via
+// Bytes(); a plain bytes.Buffer would race (and can corrupt or panic) there.
+type CaptureBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *CaptureBuffer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+// Bytes returns a copy of the captured bytes, so the caller never aliases the
+// buffer while a concurrent tee write may still be in flight.
+func (c *CaptureBuffer) Bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.buf.Bytes()
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
 // CaptureWrap creates a TeeReader to capture the body while streaming upstream
-func CaptureWrap(req *http.Request) (*bytes.Buffer, *http.Request) {
-	var captureBuf bytes.Buffer
-	limitWriter := LimitWriter(&captureBuf, config.MaxCaptureSize)
+func CaptureWrap(req *http.Request) (*CaptureBuffer, *http.Request) {
+	captureBuf := &CaptureBuffer{}
+	limitWriter := LimitWriter(captureBuf, config.MaxCaptureSize)
 	proxyBody := &StartTeeReadCloser{
 		Reader: io.TeeReader(req.Body, limitWriter),
 		Closer: req.Body,
 	}
 	req.Body = proxyBody
-	return &captureBuf, req
+	return captureBuf, req
 }
 
 // PrepareProxyRequest clones and sanitizes a request for upstream forwarding
