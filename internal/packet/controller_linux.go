@@ -126,6 +126,11 @@ func (c *Controller) Start(ctx context.Context) error {
 				c.Logger.Error("Panic in NFQUEUE callback",
 					zap.Any("panic", r),
 					zap.String("stack", string(debug.Stack())))
+				// Don't orphan the held packet on a recovered panic: accept it
+				// so the target's traffic isn't wedged in the kernel queue.
+				if a.PacketID != nil {
+					_ = c.nfq.SetVerdict(*a.PacketID, nfqueue.NfAccept)
+				}
 			}
 		}()
 
