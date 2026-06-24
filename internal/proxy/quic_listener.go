@@ -86,6 +86,7 @@ func (q *QuicListener) handle(w http.ResponseWriter, r *http.Request) {
 	captureBuf, proxyReq := CaptureWrap(r)
 	proxyReq2 := PrepareProxyRequest(proxyReq)
 	proxyReq2.Body = proxyReq.Body
+	proxyReq2.ContentLength = r.ContentLength // preserve framing (else re-sent chunked)
 
 	resp, err := q.UpstreamClient.Do(proxyReq2)
 

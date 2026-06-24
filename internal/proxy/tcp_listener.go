@@ -146,7 +146,8 @@ func (t *TcpListener) forwardRequest(clientConn net.Conn, req *http.Request) boo
 	captureBuf, proxyReq := CaptureWrap(req)
 	proxyReq.ContentLength = req.ContentLength // Restore length
 	proxyReq2 := PrepareProxyRequest(proxyReq)
-	proxyReq2.Body = proxyReq.Body // Link TeeReader
+	proxyReq2.Body = proxyReq.Body                   // Link TeeReader
+	proxyReq2.ContentLength = proxyReq.ContentLength // preserve framing (else re-sent chunked)
 
 	resp, err := t.UpstreamClient.Do(proxyReq2)
 

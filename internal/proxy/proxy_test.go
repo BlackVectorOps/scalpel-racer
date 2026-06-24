@@ -252,6 +252,49 @@ func TestInterceptor_UpstreamFailure(t *testing.T) {
 	}
 }
 
+func TestForwardRequest_PreservesContentLength(t *testing.T) {
+	var gotCL int64
+	var gotChunked bool
+	done := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCL = r.ContentLength
+		for _, te := range r.TransferEncoding {
+			if te == "chunked" {
+				gotChunked = true
+			}
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+		close(done)
+	}))
+	defer upstream.Close()
+
+	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0}, zap.NewNop())
+	p.Start()
+	defer p.Close()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", p.Tcp.Port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	body := "name=value&amount=100"
+	fmt.Fprintf(conn, "POST %s/ HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		upstream.URL, strings.TrimPrefix(upstream.URL, "http://"), len(body), body)
+
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, _ = io.ReadAll(conn)
+	<-done
+
+	if gotChunked {
+		t.Error("fixed Content-Length body was re-framed as chunked upstream")
+	}
+	if gotCL != int64(len(body)) {
+		t.Errorf("upstream Content-Length = %d, want %d", gotCL, len(body))
+	}
+}
+
 func TestSanitizeHeaders(t *testing.T) {
 	h := http.Header{}
 	h.Set("Connection", "upgrade, x-custom-hop")
