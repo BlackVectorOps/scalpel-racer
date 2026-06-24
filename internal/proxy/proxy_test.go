@@ -370,6 +370,24 @@ func TestInterceptor_captureAndForwardStandard(t *testing.T) {
 		}
 	})
 
+	t.Run("Forwards request body", func(t *testing.T) {
+		var got []byte
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer target.Close()
+
+		p.Client.Transport = http.DefaultTransport
+
+		req := httptest.NewRequest("POST", target.URL, strings.NewReader("payload=42"))
+		p.CaptureAndForwardStandard(httptest.NewRecorder(), req)
+
+		if string(got) != "payload=42" {
+			t.Errorf("upstream received body %q, want %q (body dropped?)", got, "payload=42")
+		}
+	})
+
 	t.Run("Upstream failure", func(t *testing.T) {
 		p.Client.Transport = &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
