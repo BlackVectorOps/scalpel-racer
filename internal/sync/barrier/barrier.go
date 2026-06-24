@@ -43,8 +43,12 @@ func (b *SpinBarrier) Await(ctx context.Context) error {
 	spin := 0
 	for atomic.LoadInt32(&b.flag) == 0 {
 		spin++
-		// Periodic safety check to prevent deadlock/starvation
-		if spin&config.SpinBarrierCheck == 0 {
+		// Periodic safety check to prevent deadlock/starvation.
+		// SpinBarrierCheck is the period (check every Nth iteration), so this
+		// must be modulo, not a bitmask: `spin & 1024` is true for whole
+		// 1024-iteration windows (~half of all spins), which would call
+		// Gosched() far too often and destroy the spin precision.
+		if spin%config.SpinBarrierCheck == 0 {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
