@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xkilldash9x/scalpel-cli/pkg/customhttp"
@@ -21,10 +22,11 @@ import (
 
 // SyncReader implements the "Quic-Fin-Sync" technique using SpinBarrier.
 type SyncReader struct {
-	data   []byte
-	offset int
-	gate   *barrier.SpinBarrier
-	ctx    context.Context
+	data    []byte
+	offset  int
+	gate    *barrier.SpinBarrier
+	ctx     context.Context
+	arrived int32 // atomically set once this reader has voted at the gate
 }
 
 func (r *SyncReader) Read(p []byte) (n int, err error) {
@@ -46,7 +48,9 @@ func (r *SyncReader) Read(p []byte) (n int, err error) {
 
 	// Check if we are at the critical last byte
 	if remaining == 1 {
-		// Spin until release
+		// Mark that we will vote at the gate (so the worker's defer does not
+		// double-vote), then spin until release.
+		atomic.StoreInt32(&r.arrived, 1)
 		if err := r.gate.Await(r.ctx); err != nil {
 			return 0, err
 		}
@@ -142,6 +146,15 @@ func (r *Racer) RunH3Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 				gate: gate,
 				ctx:  raceCtx,
 			}
+
+			// If this worker never reaches the final-byte barrier (e.g. the
+			// request errors before the body is fully read), vote anyway so
+			// WaitReady can reach its target instead of hanging the burst.
+			defer func() {
+				if atomic.LoadInt32(&reader.arrived) == 0 {
+					gate.Arrive()
+				}
+			}()
 
 			req, err := http.NewRequestWithContext(raceCtx, reqSpec.Method, reqSpec.URL, reader)
 			if err != nil {
