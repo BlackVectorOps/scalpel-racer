@@ -37,8 +37,17 @@ func NewQuicListener(port int, pipeline *IngestionPipeline, cm *CertManager, cli
 func (q *QuicListener) Start() error {
 	q.Server = &http3.Server{
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{q.CertManager.GetCA()},
-			NextProtos:   []string{"h3"},
+			// Mint a per-host leaf certificate from the CA for each handshake,
+			// keyed on SNI -- mirroring the TCP listener's GetOrCreate. Presenting
+			// the CA certificate itself (IsCA, no SAN, no ServerAuth EKU) made
+			// every h3 client reject the connection.
+			GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				if hello.ServerName == "" {
+					return nil, fmt.Errorf("h3: missing SNI server name")
+				}
+				return q.CertManager.GetOrCreate(hello.ServerName)
+			},
+			NextProtos: []string{"h3"},
 		},
 		Handler: http.HandlerFunc(q.handle),
 		QUICConfig: &quic.Config{
