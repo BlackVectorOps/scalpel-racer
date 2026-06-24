@@ -2,6 +2,7 @@
 package models_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,9 +10,19 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xkilldash9x/scalpel-racer/internal/models"
 )
+
+func TestNewScanResult_SnippetIsValidUTF8(t *testing.T) {
+	// A 3-byte rune straddling the 50-byte snippet boundary (49 'a' + "の").
+	body := append(bytes.Repeat([]byte("a"), 49), []byte("の")...)
+	r := models.NewScanResult(1, 200, 0, body, nil)
+	if !utf8.ValidString(r.BodySnippet) {
+		t.Errorf("BodySnippet is not valid UTF-8: %q", r.BodySnippet)
+	}
+}
 
 func TestScanResult_JSONIncludesErrorMessage(t *testing.T) {
 	r := models.NewScanResult(1, 0, 0, nil, errors.New("boom"))

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // CapturedRequest represents the attack configuration.
@@ -77,7 +78,17 @@ func NewScanResult(index int, statusCode int, duration time.Duration, body []byt
 		if len(body) < limit {
 			limit = len(body)
 		}
-		r.BodySnippet = string(body[:limit])
+		snippet := body[:limit]
+		// Back off a trailing partial UTF-8 rune so the snippet is always valid
+		// UTF-8 (slicing at a fixed byte offset can split a multi-byte rune).
+		for len(snippet) > 0 {
+			if r, size := utf8.DecodeLastRune(snippet); r == utf8.RuneError && size == 1 {
+				snippet = snippet[:len(snippet)-1]
+			} else {
+				break
+			}
+		}
+		r.BodySnippet = string(snippet)
 	} else {
 		r.BodyHash = "empty"
 	}
