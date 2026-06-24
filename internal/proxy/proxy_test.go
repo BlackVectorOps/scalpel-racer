@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,24 +146,38 @@ func TestInterceptor_Stability(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer conn.Close()
-		conn.Write([]byte("\xDE\xAD\xBE\xEF\x00\x01\x02"))
+		// A complete but malformed request line: http.ReadRequest parses it,
+		// fails, and the proxy must close the connection without responding --
+		// rather than answering with junk or hanging open.
+		conn.Write([]byte("\xDE\xAD\xBE\xEF bad request line\r\n\r\n"))
 
-		// FIX: Set deadline to prevent deadlock if server keeps alive
-		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		io.ReadAll(conn)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		data, err := io.ReadAll(conn)
+		if len(data) != 0 {
+			t.Errorf("server responded to a malformed request instead of closing: %q", data)
+		}
+		// Tolerate FIN vs RST on close, but a read deadline firing means the
+		// proxy hung on a complete malformed request, which is a bug.
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			t.Error("server hung on a malformed request instead of closing the connection")
+		}
 	})
 
-	t.Run("Invalid HTTP Request", func(t *testing.T) {
+	t.Run("Unforwardable Request (no host)", func(t *testing.T) {
 		conn, err := net.Dial("tcp", address)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer conn.Close()
+		// Valid HTTP/1.1 but no host to forward to -> the proxy must answer 502.
 		conn.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
 
-		// FIX: Set deadline. The server is now Keep-Alive, so it won't close!
-		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		io.ReadAll(conn)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		data, _ := io.ReadAll(conn)
+		if !bytes.Contains(data, []byte("502")) {
+			t.Errorf("expected 502 Bad Gateway for an unforwardable request, got: %q", data)
+		}
 	})
 
 	t.Run("Junk After HTTPS Connect", func(t *testing.T) {
@@ -181,35 +196,18 @@ func TestInterceptor_Stability(t *testing.T) {
 		req.Write(conn)
 
 		br := bufio.NewReader(conn)
-		br.ReadString('\n') // Read "200 OK"
-
-		conn.Write([]byte("this is not a valid tls handshake"))
-
-		// FIX: Set deadline here too
-		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		io.ReadAll(conn)
-	})
-
-	t.Run("Junk After HTTPS Connect", func(t *testing.T) {
-		secureTarget := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Write([]byte("SecureData"))
-		}))
-		defer secureTarget.Close()
-
-		conn, err := net.Dial("tcp", address)
-		if err != nil {
-			t.Fatal(err)
+		statusLine, _ := br.ReadString('\n')
+		if !strings.Contains(statusLine, "200") {
+			t.Fatalf("CONNECT not acknowledged with 200: %q", statusLine)
 		}
-		defer conn.Close()
 
-		req, _ := http.NewRequest("CONNECT", secureTarget.URL, nil)
-		req.Write(conn)
-
-		br := bufio.NewReader(conn)
-		br.ReadString('\n')
-
+		// Garbage instead of a TLS ClientHello: the handshake must fail and the
+		// proxy must close the tunnel (clean EOF), not hang.
 		conn.Write([]byte("this is not a valid tls handshake"))
-		io.ReadAll(conn)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := io.ReadAll(conn); err != nil {
+			t.Errorf("expected clean close after a bad TLS handshake, got: %v", err)
+		}
 	})
 
 	t.Run("Client Disconnect During Body", func(t *testing.T) {
@@ -241,22 +239,43 @@ func TestInterceptor_UpstreamFailure(t *testing.T) {
 		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
 	}
 
+	// On upstream dial failure the proxy tears down the proxied connection, so
+	// through a live socket the client sees either a 5xx or a torn-down
+	// connection -- never a success. (The clean 502 *body* on the handler path
+	// is asserted by TestInterceptor_captureAndForwardStandard/Upstream failure.)
 	resp, err := client.Get("http://will-fail.com")
-	if err == nil {
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusBadGateway {
-			t.Errorf("Expected 502, got %d", resp.StatusCode)
-		}
+	if err != nil {
+		return // connection torn down on upstream failure -- a non-success outcome
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 500 {
+		t.Errorf("upstream failure must not yield a <500 response, got %d", resp.StatusCode)
 	}
 }
 
 func TestSanitizeHeaders(t *testing.T) {
 	h := http.Header{}
-	h.Set("Connection", "upgrade, keep-alive")
+	h.Set("Connection", "upgrade, x-custom-hop")
 	h.Set("Upgrade", "websocket")
+	h.Set("Keep-Alive", "timeout=5")
+	h.Set("X-Custom-Hop", "drop-me") // named in Connection, but NOT a standard hop-by-hop
+	h.Set("X-Keep", "1")             // an end-to-end header that must survive
 	proxy.SanitizeHeadersRFC9113(h)
-	if h.Get("Upgrade") != "" {
-		t.Error("Failed to strip Upgrade header")
+
+	// Statically-listed hop-by-hop headers must be stripped...
+	for _, hop := range []string{"Upgrade", "Connection", "Keep-Alive"} {
+		if got := h.Get(hop); got != "" {
+			t.Errorf("hop-by-hop header %q not stripped: %q", hop, got)
+		}
+	}
+	// ...and so must a header named in the Connection header itself (this is the
+	// only assertion that exercises the dynamic Connection-list stripping, since
+	// X-Custom-Hop is not in the static list).
+	if got := h.Get("X-Custom-Hop"); got != "" {
+		t.Errorf("Connection-listed header X-Custom-Hop not stripped: %q", got)
+	}
+	if h.Get("X-Keep") != "1" {
+		t.Error("end-to-end header X-Keep was wrongly stripped")
 	}
 }
 

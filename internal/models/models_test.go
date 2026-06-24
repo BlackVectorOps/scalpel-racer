@@ -2,6 +2,8 @@
 package models_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -64,8 +66,11 @@ func TestNewScanResult(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Errorf("Status mismatch: got %d, want 200", res.StatusCode)
 	}
-	if res.BodyHash == "" || res.BodyHash == "empty" {
-		t.Error("Hash generation failed")
+	// BodyHash must be the hex-encoded sha256 of the body -- pin the algorithm
+	// and encoding, not merely "non-empty".
+	sum := sha256.Sum256(body)
+	if want := hex.EncodeToString(sum[:]); res.BodyHash != want {
+		t.Errorf("BodyHash = %s, want %s (hex sha256)", res.BodyHash, want)
 	}
 	if res.BodySnippet != "test_payload" {
 		t.Errorf("Snippet mismatch: got %s", res.BodySnippet)
@@ -91,7 +96,13 @@ func TestNewScanResult(t *testing.T) {
 	}
 
 	resLong := models.NewScanResult(3, 200, 0, longBody, nil)
-	if len(resLong.BodySnippet) != 50 {
-		t.Errorf("Snippet not truncated correctly: got len %d, want 50", len(resLong.BodySnippet))
+	if resLong.BodySnippet != strings.Repeat("A", 50) {
+		t.Errorf("Snippet not truncated to the 50-byte prefix: got %q (len %d)", resLong.BodySnippet, len(resLong.BodySnippet))
+	}
+
+	// 4. Empty-but-non-nil body (no error) hashes to the "empty" sentinel.
+	resEmpty := models.NewScanResult(4, 200, 0, []byte{}, nil)
+	if resEmpty.BodyHash != "empty" {
+		t.Errorf("empty body should hash to \"empty\", got %q", resEmpty.BodyHash)
 	}
 }
