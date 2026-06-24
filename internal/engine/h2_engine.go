@@ -133,6 +133,10 @@ func (r *Racer) RunH2Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 	}
 
 	if err := gate.WaitReady(raceCtx); err != nil {
+		// Unblock any spinning workers and wait for them before the deferred
+		// close(results) runs, so no worker can send on a closed channel.
+		cancel()
+		wg.Wait()
 		return err
 	}
 
