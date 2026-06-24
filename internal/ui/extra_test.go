@@ -104,6 +104,32 @@ func TestUI_ResultsView(t *testing.T) {
 	})
 }
 
+func TestUI_ResultsLayoutAppliedOnAttack(t *testing.T) {
+	logger := zap.NewNop()
+	racer := engine.NewRacer(&MockFactory{}, logger)
+	m := NewModel(logger, racer)
+	defer m.Cancel() // stop the race goroutine StartRace launches
+
+	// Establish a viewport size.
+	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Enter the editor with a valid request and launch the attack (ctrl+s).
+	m.State = StateEditing
+	m.Dashboard.SelectedReq = &models.CapturedRequest{}
+	m.Editor = NewEditorModel()
+	m.Editor.SetValue("GET http://example.com HTTP/1.1\nHost: example.com\n\n")
+	m, _ = update(m, tea.KeyMsg{Type: tea.KeyCtrlS})
+
+	if m.State != StateRunning {
+		t.Fatalf("expected StateRunning after launching attack, got %v", m.State)
+	}
+	// The freshly-created ResultsModel must receive the window size, not be left
+	// at zero (which renders the results/diff panes at zero size).
+	if m.Results.Width != 120 {
+		t.Errorf("Results.Width = %d, want 120 (layout not applied)", m.Results.Width)
+	}
+}
+
 func TestUI_ErrorHandling(t *testing.T) {
 	logger := zap.NewNop()
 	racer := engine.NewRacer(&MockFactory{}, logger)

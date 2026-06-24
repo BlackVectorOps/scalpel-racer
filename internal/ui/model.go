@@ -166,7 +166,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err == nil {
 					m.State = StateRunning
 					m.Results = NewResultsModel() // Reset results
-					m.Results.Update(tea.WindowSizeMsg{Width: m.Width, Height: m.Height})
+					// ResultsModel.Update has a value receiver, so the computed
+					// layout (table/diff sizes) is only kept if we capture it.
+					m.Results, _ = m.Results.Update(tea.WindowSizeMsg{Width: m.Width, Height: m.Height})
 					return m, m.StartRace(req)
 				}
 			}
