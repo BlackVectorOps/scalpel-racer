@@ -38,13 +38,6 @@ func (p *IngestionPipeline) PersistCapture(req *http.Request, body []byte) {
 		logURL.RawQuery = "REDACTED"
 	}
 
-	p.mu.RLock()
-	if p.closed {
-		p.mu.RUnlock()
-		return
-	}
-	p.mu.RUnlock()
-
 	// Offload logic
 	var offloadPath string
 	if len(body) > config.BodyOffloadThreshold {
@@ -70,7 +63,16 @@ func (p *IngestionPipeline) PersistCapture(req *http.Request, body []byte) {
 		OffloadPath: offloadPath,
 	}
 
-	// Non-blocking send
+	// Hold the read lock across the closed-check and the (non-blocking) send.
+	// Close() takes the write lock before it closes CaptureChan, so it cannot
+	// close the channel between this check and the send -- which would otherwise
+	// panic with "send on closed channel". The send is non-blocking, so holding
+	// the lock cannot deadlock Close().
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return
+	}
 	select {
 	case p.CaptureChan <- captured:
 		p.Logger.Info("Captured request", zap.String("url", logURL.String()))
