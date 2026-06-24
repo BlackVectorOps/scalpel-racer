@@ -225,10 +225,13 @@ func TestInterceptor_UpstreamFailure(t *testing.T) {
 	logger := zap.NewNop()
 	p, _ := proxy.NewInterceptor(proxy.InterceptorConfig{Port: 0}, logger)
 
-	p.Client.Transport = &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return nil, errors.New("connection refused simulation")
-		},
+	// Make every upstream dial fail, but keep the interceptor's real transport
+	// settings -- in particular IdleConnTimeout, which drives the keep-alive read
+	// deadline. (Replacing the whole transport with a zero-value one sets
+	// IdleConnTimeout=0, which makes the proxy's read deadline fire immediately
+	// and abortively reset the connection, so the client never sees the 502.)
+	p.Client.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("connection refused simulation")
 	}
 
 	p.Start()
@@ -239,17 +242,13 @@ func TestInterceptor_UpstreamFailure(t *testing.T) {
 		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
 	}
 
-	// On upstream dial failure the proxy tears down the proxied connection, so
-	// through a live socket the client sees either a 5xx or a torn-down
-	// connection -- never a success. (The clean 502 *body* on the handler path
-	// is asserted by TestInterceptor_captureAndForwardStandard/Upstream failure.)
 	resp, err := client.Get("http://will-fail.com")
 	if err != nil {
-		return // connection torn down on upstream failure -- a non-success outcome
+		t.Fatalf("proxy should return a 502 on upstream failure, got transport error: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 500 {
-		t.Errorf("upstream failure must not yield a <500 response, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502 Bad Gateway on upstream failure, got %d", resp.StatusCode)
 	}
 }
 
