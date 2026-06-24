@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xkilldash9x/scalpel-racer/internal/config"
 	"go.uber.org/zap"
 )
 
@@ -62,8 +63,15 @@ func (t *TcpListener) handleConnection(clientConn net.Conn) {
 	br := bufio.NewReader(clientConn)
 	proxyConn := NewBufferedConn(clientConn, br)
 
+	// Resolve the keep-alive idle timeout once, tolerating a non-*http.Transport
+	// (an unchecked assertion here would panic the per-connection goroutine).
+	idleTimeout := config.IdleConnTimeout
+	if tr, ok := t.UpstreamClient.Transport.(*http.Transport); ok && tr.IdleConnTimeout > 0 {
+		idleTimeout = tr.IdleConnTimeout
+	}
+
 	for {
-		if err := clientConn.SetReadDeadline(time.Now().Add(t.UpstreamClient.Transport.(*http.Transport).IdleConnTimeout)); err != nil {
+		if err := clientConn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
 			return
 		}
 

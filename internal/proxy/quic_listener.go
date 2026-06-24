@@ -105,7 +105,9 @@ func (q *QuicListener) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		q.Logger.Debug("h3 response copy error", zap.Error(err))
+	}
 }
 
 func (q *QuicListener) Close() {
