@@ -2,6 +2,7 @@
 package engine_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -140,19 +141,58 @@ func TestH1Race_Flow(t *testing.T) {
 	racer := engine.NewRacer(&MockClientFactory{H1: mockH1}, zap.NewNop())
 	req := &models.CapturedRequest{URL: "http://e.com", Body: []byte("A{{SYNC}}B")}
 
-	concurrency := 1
-	resultsCh := make(chan models.ScanResult, concurrency)
-
-	// RunH1Race closes resultsCh upon completion/return, so we should NOT close it here again
-	err := racer.RunH1Race(context.Background(), req, concurrency, resultsCh)
-	if err != nil {
+	resultsCh := make(chan models.ScanResult, 1)
+	// RunH1Race closes resultsCh upon completion/return.
+	if err := racer.RunH1Race(context.Background(), req, 1, resultsCh); err != nil {
 		t.Fatalf("Race failed: %v", err)
 	}
 
 	results := drainResults(resultsCh)
-
 	if len(results) != 1 {
-		t.Error("Expected 1 result")
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].Error != nil {
+		t.Errorf("result error: %v", results[0].Error)
+	}
+	if results[0].StatusCode != 200 {
+		t.Errorf("status = %d, want 200", results[0].StatusCode)
+	}
+	if string(results[0].Body) != "OK" {
+		t.Errorf("body = %q, want OK", results[0].Body)
+	}
+
+	// "A{{SYNC}}B" must be sent as two wire stages (headers+"A", then "B").
+	mockH1.mu.Lock()
+	sent := mockH1.SentData
+	mockH1.mu.Unlock()
+	if len(sent) != 2 {
+		t.Fatalf("expected 2 wire stages sent, got %d", len(sent))
+	}
+	if string(sent[1]) != "B" {
+		t.Errorf("stage 1 = %q, want \"B\"", sent[1])
+	}
+
+	// Reassembling the stages must be exactly one well-framed request whose
+	// Content-Length matches the marker-stripped body ("AB"), with no orphaned
+	// trailing bytes -- the engine-level guard for the staged-framing (C1) fix.
+	var wire bytes.Buffer
+	wire.Write(sent[0])
+	wire.Write(sent[1])
+	br := bufio.NewReader(bytes.NewReader(wire.Bytes()))
+	parsed, err := http.ReadRequest(br)
+	if err != nil {
+		t.Fatalf("reassembled stages are not a valid request: %v", err)
+	}
+	gotBody, _ := io.ReadAll(parsed.Body)
+	leftover, _ := io.ReadAll(br)
+	if parsed.ContentLength != 2 {
+		t.Errorf("Content-Length = %d, want 2", parsed.ContentLength)
+	}
+	if string(gotBody) != "AB" {
+		t.Errorf("reassembled body = %q, want \"AB\"", gotBody)
+	}
+	if len(leftover) != 0 {
+		t.Errorf("orphaned bytes after body (smuggling): %q", leftover)
 	}
 }
 
@@ -187,7 +227,10 @@ func TestH1Race_SystematicErrorPaths(t *testing.T) {
 		// RunH1Race closes resultsCh
 		_ = r.RunH1Race(context.Background(), &models.CapturedRequest{URL: "http://e.com"}, 1, resultsCh)
 		res := drainResults(resultsCh)
-		if len(res) > 0 && res[0].Error == nil {
+		if len(res) != 1 {
+			t.Fatalf("expected exactly 1 result, got %d", len(res))
+		}
+		if res[0].Error == nil {
 			t.Error("Expected factory error propagation")
 		}
 	})
@@ -230,6 +273,7 @@ func TestH2Race_Flow(t *testing.T) {
 	mockH2 := &MockH2Client{
 		PreparedHandle:     &customhttp.H2StreamHandle{},
 		ResponseStatusCode: 202,
+		ResponseBody:       []byte("accepted"),
 	}
 	racer := engine.NewRacer(&MockClientFactory{H2: mockH2}, zap.NewNop())
 	req := &models.CapturedRequest{URL: "https://e.com", Body: []byte("test")}
@@ -237,24 +281,22 @@ func TestH2Race_Flow(t *testing.T) {
 	concurrency := 5
 	resultsCh := make(chan models.ScanResult, concurrency)
 
-	// Note: engine implementation for H2 likely handles closing too, but checking H1 specifically for now based on logs.
-	// If H2 follows same pattern, we assume correct behavior or fix if needed.
-	// Based on H1 fix, we should likely trust the engine to close or check H2 implementation.
-	// Provided logs only showed panic in TestH1Race_Flow.
-	err := racer.RunH2Race(context.Background(), req, concurrency, resultsCh)
-	if err != nil {
+	// RunH2Race closes resultsCh on return.
+	if err := racer.RunH2Race(context.Background(), req, concurrency, resultsCh); err != nil {
 		t.Fatalf("H2 race failed: %v", err)
 	}
-	// Warning: If RunH2Race also defers close, this is a bug.
-	// Assuming symmetry with H1, we should remove this close as well to be safe,
-	// though the log didn't explicitly trigger here yet.
-	// However, looking at the code provided for H1, it closes. I don't have H2 code but safer to assume symmetry.
-	// I will comment it out to be consistent with the fix pattern.
-	// close(resultsCh)
 
 	results := drainResults(resultsCh)
-	if len(results) != 5 {
-		t.Errorf("Expected 5 results, got %d", len(results))
+	if len(results) != concurrency {
+		t.Fatalf("expected %d results, got %d", concurrency, len(results))
+	}
+	for i, r := range results {
+		if r.Error != nil {
+			t.Errorf("result[%d] error: %v", i, r.Error)
+		}
+		if r.StatusCode != 202 {
+			t.Errorf("result[%d] status = %d, want 202", i, r.StatusCode)
+		}
 	}
 }
 
