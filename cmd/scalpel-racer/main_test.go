@@ -36,3 +36,16 @@ func TestRun(t *testing.T) {
 		}
 	}
 }
+
+// TestRunCleanExitOnCancel locks in the H5 contract: a signal-driven shutdown
+// (modelled here as an already-cancelled context) is a clean exit -- Run must
+// return nil, not the ErrProgramKilled it gets back from bubbletea. It also
+// exercises the graceful-shutdown path (cancel + bounded wait for races).
+func TestRunCleanExitOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate SIGINT arriving at/just before startup
+
+	if err := Run(ctx, []string{"-p", "0"}, bytes.NewBuffer(nil), io.Discard); err != nil {
+		t.Errorf("Run should exit cleanly (nil) on a cancelled context, got: %v", err)
+	}
+}
