@@ -67,6 +67,7 @@ type Controller struct {
 	closed      bool
 
 	flushTimer *time.Timer
+	releaseWg  sync.WaitGroup
 }
 
 func NewController(ip string, port int, concurrency int, logger *zap.Logger) *Controller {
@@ -268,7 +269,9 @@ func (c *Controller) triggerReleaseLocked() {
 	idsToRelease := make([]uint32, len(c.heldIDs))
 	copy(idsToRelease, c.heldIDs)
 
+	c.releaseWg.Add(1)
 	go func(ids []uint32) {
+		defer c.releaseWg.Done()
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
@@ -304,6 +307,10 @@ func (c *Controller) Close() {
 	}
 	c.triggerReleaseLocked()
 	c.mu.Unlock()
+
+	// Wait for the burst-release goroutine(s) to finish writing verdicts before
+	// closing the netlink socket they use (avoids a use-after-close data race).
+	c.releaseWg.Wait()
 
 	if c.nfq != nil {
 		c.nfq.Close()
