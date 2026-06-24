@@ -6,6 +6,7 @@ package packet
 import (
 	"testing"
 
+	"github.com/florianl/go-nfqueue/v2"
 	"go.uber.org/zap"
 )
 
@@ -34,8 +35,13 @@ func FuzzEvaluatePacket(f *testing.F) {
 			releaseChan: make(chan struct{}),
 		}
 
-		// We don't care about the return value (verdict), only that it doesn't panic.
-		_ = c.evaluatePacket(12345, payload)
+		// evaluatePacket may only return -1 (hold) or NfAccept (pass); any other
+		// value (e.g. an accidental NfDrop=0) is a logic regression, not just a
+		// panic.
+		v := c.evaluatePacket(12345, payload)
+		if v != -1 && v != nfqueue.NfAccept {
+			t.Fatalf("evaluatePacket returned unexpected verdict %d for payload %x", v, payload)
+		}
 
 		// Clean up any timers created to avoid leaking goroutines during fuzzing
 		c.mu.Lock()

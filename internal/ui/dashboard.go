@@ -65,8 +65,9 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 
 	case CaptureMsg:
 		m.History.Add(msg)
-		rows := make([]table.Row, len(m.History.List()))
-		for i, r := range m.History.List() {
+		list := m.History.List() // one locked snapshot, not two
+		rows := make([]table.Row, len(list))
+		for i, r := range list {
 			rows[i] = table.Row{fmt.Sprintf("%d", i), r.Method, r.Headers["Host"], r.URL, r.Protocol}
 		}
 		m.Table.SetRows(rows)
@@ -78,7 +79,7 @@ func (m DashboardModel) Update(msg tea.Msg) (DashboardModel, tea.Cmd) {
 		m.IsLoading = false
 		if msg.Err != nil {
 			m.LastError = msg.Err.Error()
-		} else {
+		} else if m.SelectedReq != nil {
 			m.SelectedReq.Body = msg.Content
 		}
 
@@ -97,7 +98,7 @@ func (m DashboardModel) View() string {
 		return lipgloss.Place(m.Width, m.Height, lipgloss.Center, lipgloss.Center,
 			lipgloss.JoinVertical(lipgloss.Center, m.Spinner.View(), "Hydrating payload from disk..."))
 	}
-	if m.History.size == 0 {
+	if m.History.Size() == 0 {
 		// Updated to use empty state styles
 		return lipgloss.Place(m.Width, m.Height-5, lipgloss.Center, lipgloss.Center,
 			lipgloss.JoinVertical(lipgloss.Center,

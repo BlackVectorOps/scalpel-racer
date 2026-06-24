@@ -66,7 +66,6 @@ func (w *Writer) writeCSV(results []models.ScanResult, path string) error {
 	defer f.Close()
 
 	cw := csv.NewWriter(f)
-	defer cw.Flush()
 
 	// Header
 	header := []string{"Index", "Status", "Duration(ns)", "Hash", "Error"}
@@ -92,5 +91,8 @@ func (w *Writer) writeCSV(results []models.ScanResult, path string) error {
 		}
 	}
 
-	return nil
+	// Flush explicitly and surface any buffered write error -- a deferred
+	// Flush() would discard it and report a truncated CSV as success.
+	cw.Flush()
+	return cw.Error()
 }

@@ -234,30 +234,99 @@ func TestHistory_RingBuffer(t *testing.T) {
 	}
 }
 
+func TestHistory_CleansAdoptedAndEvictedFiles(t *testing.T) {
+	h := NewRequestHistory(2, zap.NewNop())
+
+	// A pipeline-offloaded request: Body already nil, OffloadPath set.
+	f, err := os.CreateTemp("", "scalpel-adopt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	h.Add(&models.CapturedRequest{Method: "POST", OffloadPath: f.Name()})
+
+	// Evict it from the size-2 ring with two more (large-body) entries.
+	big := make([]byte, BodyOffloadThreshold+1)
+	h.Add(&models.CapturedRequest{Method: "A", Body: big})
+	h.Add(&models.CapturedRequest{Method: "B", Body: big})
+
+	if _, err := os.Stat(f.Name()); err != nil {
+		t.Fatalf("adopted file should still exist before Close: %v", err)
+	}
+
+	h.Close()
+
+	// The first request was evicted from the ring, but Close must still remove
+	// its offload file (tracked separately, not just iterated from the buffer).
+	if _, err := os.Stat(f.Name()); !os.IsNotExist(err) {
+		t.Errorf("adopted offload file leaked after eviction + Close: %v", err)
+	}
+}
+
 func TestRequestToText(t *testing.T) {
 	req := &models.CapturedRequest{
 		Method:   "GET",
 		URL:      "http://test.com",
-		Headers:  map[string]string{"Host": "test.com"},
+		Headers:  map[string]string{"Host": "test.com", "Accept": "*/*"},
 		Protocol: "HTTP/1.1",
 		Body:     []byte("test body"),
 	}
 	text := requestToText(req)
-	if !strings.Contains(text, "GET http://test.com HTTP/1.1") {
-		t.Error("Request line not present in output")
+
+	// Full, deterministic serialization: request line, sorted headers (Accept
+	// before Host), a blank line, then the body verbatim.
+	want := "GET http://test.com HTTP/1.1\n" +
+		"Accept: */*\n" +
+		"Host: test.com\n" +
+		"\n" +
+		"test body"
+	if text != want {
+		t.Errorf("serialization mismatch:\n got: %q\nwant: %q", text, want)
 	}
 }
 
 func TestTextToRequest(t *testing.T) {
-	text := "GET http://test.com HTTP/1.1\nHost: test.com\n\nsome body data"
-	req, err := textToRequest(text, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if req.Method != "GET" {
-		t.Errorf("Method mismatch: got %s", req.Method)
-	}
-	if string(req.Body) != "some body data" {
-		t.Errorf("Body mismatch: got %s", string(req.Body))
-	}
+	t.Run("basic", func(t *testing.T) {
+		text := "GET http://test.com HTTP/1.1\nHost: test.com\n\nsome body data"
+		req, err := textToRequest(text, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if req.Method != "GET" {
+			t.Errorf("Method mismatch: got %s", req.Method)
+		}
+		if req.URL != "http://test.com" {
+			t.Errorf("URL mismatch: got %s", req.URL)
+		}
+		if string(req.Body) != "some body data" {
+			t.Errorf("Body mismatch: got %s", string(req.Body))
+		}
+		// Content-Length is auto-set to the body length (14 bytes).
+		if got := req.Headers["Content-Length"]; got != "14" {
+			t.Errorf("Content-Length: got %q want 14", got)
+		}
+	})
+
+	t.Run("relative URL rebuilt from original", func(t *testing.T) {
+		original := &models.CapturedRequest{
+			URL:     "https://api.example.com/v1",
+			Headers: map[string]string{"Host": "api.example.com"},
+		}
+		// Editor content with a relative path and no Host header.
+		text := "POST /transfer HTTP/1.1\n\namount=100"
+		req, err := textToRequest(text, original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Scheme/host restored from the original capture.
+		if req.URL != "https://api.example.com/transfer" {
+			t.Errorf("relative URL not rebuilt: got %q", req.URL)
+		}
+		if req.Headers["Host"] != "api.example.com" {
+			t.Errorf("Host not restored: got %q", req.Headers["Host"])
+		}
+		if req.Headers["Content-Length"] != "10" {
+			t.Errorf("Content-Length: got %q want 10", req.Headers["Content-Length"])
+		}
+	})
 }

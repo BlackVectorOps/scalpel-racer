@@ -112,6 +112,11 @@ func (i *Interceptor) CaptureAndForwardStandard(w http.ResponseWriter, req *http
 	captureBuf, proxyReq := CaptureWrap(req)
 	proxyReq.ContentLength = req.ContentLength
 	proxyReq2 := PrepareProxyRequest(proxyReq)
+	// Re-link the captured (TeeReader) body and preserve its length so the
+	// request body is actually forwarded; PrepareProxyRequest builds the upstream
+	// request with http.NoBody (matching forwardRequest in the TCP listener).
+	proxyReq2.Body = proxyReq.Body
+	proxyReq2.ContentLength = proxyReq.ContentLength
 
 	// Use the shared client
 	resp, err := i.Client.Do(proxyReq2)

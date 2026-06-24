@@ -2,13 +2,40 @@
 package models_test
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xkilldash9x/scalpel-racer/internal/models"
 )
+
+func TestNewScanResult_SnippetIsValidUTF8(t *testing.T) {
+	// A 3-byte rune straddling the 50-byte snippet boundary (49 'a' + "の").
+	body := append(bytes.Repeat([]byte("a"), 49), []byte("の")...)
+	r := models.NewScanResult(1, 200, 0, body, nil)
+	if !utf8.ValidString(r.BodySnippet) {
+		t.Errorf("BodySnippet is not valid UTF-8: %q", r.BodySnippet)
+	}
+}
+
+func TestScanResult_JSONIncludesErrorMessage(t *testing.T) {
+	r := models.NewScanResult(1, 0, 0, nil, errors.New("boom"))
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The error interface marshals to {}; the message must be carried in a
+	// string field instead so reports actually contain it.
+	if !strings.Contains(string(b), `"error":"boom"`) {
+		t.Errorf("JSON should carry the error message, got: %s", b)
+	}
+}
 
 func TestCapturedRequest_Clone(t *testing.T) {
 	original := &models.CapturedRequest{
@@ -64,8 +91,11 @@ func TestNewScanResult(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Errorf("Status mismatch: got %d, want 200", res.StatusCode)
 	}
-	if res.BodyHash == "" || res.BodyHash == "empty" {
-		t.Error("Hash generation failed")
+	// BodyHash must be the hex-encoded sha256 of the body -- pin the algorithm
+	// and encoding, not merely "non-empty".
+	sum := sha256.Sum256(body)
+	if want := hex.EncodeToString(sum[:]); res.BodyHash != want {
+		t.Errorf("BodyHash = %s, want %s (hex sha256)", res.BodyHash, want)
 	}
 	if res.BodySnippet != "test_payload" {
 		t.Errorf("Snippet mismatch: got %s", res.BodySnippet)
@@ -91,7 +121,13 @@ func TestNewScanResult(t *testing.T) {
 	}
 
 	resLong := models.NewScanResult(3, 200, 0, longBody, nil)
-	if len(resLong.BodySnippet) != 50 {
-		t.Errorf("Snippet not truncated correctly: got len %d, want 50", len(resLong.BodySnippet))
+	if resLong.BodySnippet != strings.Repeat("A", 50) {
+		t.Errorf("Snippet not truncated to the 50-byte prefix: got %q (len %d)", resLong.BodySnippet, len(resLong.BodySnippet))
+	}
+
+	// 4. Empty-but-non-nil body (no error) hashes to the "empty" sentinel.
+	resEmpty := models.NewScanResult(4, 200, 0, []byte{}, nil)
+	if resEmpty.BodyHash != "empty" {
+		t.Errorf("empty body should hash to \"empty\", got %q", resEmpty.BodyHash)
 	}
 }

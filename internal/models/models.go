@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 // CapturedRequest represents the attack configuration.
@@ -51,7 +52,8 @@ type ScanResult struct {
 	BodyHash    string            `json:"body_hash"`
 	BodySnippet string            `json:"body_snippet"`
 	Body        []byte            `json:"-"` // Exclude raw body from JSON summary
-	Error       error             `json:"error,omitempty"`
+	Error       error             `json:"-"` // interface; marshals to {}, so excluded -- see ErrorMsg
+	ErrorMsg    string            `json:"error,omitempty"`
 	Meta        map[string]string `json:"meta,omitempty"`
 }
 
@@ -64,6 +66,9 @@ func NewScanResult(index int, statusCode int, duration time.Duration, body []byt
 		Body:       body,
 		Meta:       make(map[string]string),
 	}
+	if err != nil {
+		r.ErrorMsg = err.Error()
+	}
 
 	if err == nil && len(body) > 0 {
 		hash := sha256.Sum256(body)
@@ -73,7 +78,17 @@ func NewScanResult(index int, statusCode int, duration time.Duration, body []byt
 		if len(body) < limit {
 			limit = len(body)
 		}
-		r.BodySnippet = string(body[:limit])
+		snippet := body[:limit]
+		// Back off a trailing partial UTF-8 rune so the snippet is always valid
+		// UTF-8 (slicing at a fixed byte offset can split a multi-byte rune).
+		for len(snippet) > 0 {
+			if r, size := utf8.DecodeLastRune(snippet); r == utf8.RuneError && size == 1 {
+				snippet = snippet[:len(snippet)-1]
+			} else {
+				break
+			}
+		}
+		r.BodySnippet = string(snippet)
 	} else {
 		r.BodyHash = "empty"
 	}

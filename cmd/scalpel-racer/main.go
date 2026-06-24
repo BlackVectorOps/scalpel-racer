@@ -3,12 +3,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/xkilldash9x/scalpel-racer/internal/config"
@@ -76,6 +78,15 @@ func Run(ctx context.Context, args []string, input io.Reader, output io.Writer) 
 
 	// -- UI --
 	model := ui.NewModel(logger, racer)
+	// Tie the UI's race / packet-controller context to the signal context so a
+	// SIGINT/SIGTERM cancels any in-flight attack and runs its cleanup (e.g.
+	// removing the NFQUEUE iptables rule) instead of leaving it orphaned.
+	// NewModel seeds a default Background context; discard it for the wired one.
+	if model.Cancel != nil {
+		model.Cancel()
+	}
+	model.Ctx, model.Cancel = context.WithCancel(ctx)
+
 	// passes the injected context to the tea program
 	p := tea.NewProgram(
 		model,
@@ -101,8 +112,30 @@ func Run(ctx context.Context, args []string, input io.Reader, output io.Writer) 
 		}
 	}()
 
-	if _, err := p.Run(); err != nil {
-		return err
+	_, runErr := p.Run()
+
+	// Deterministic shutdown: cancel any in-flight race and wait (bounded) for
+	// it to finish its cleanup -- e.g. removing the NFQUEUE iptables rule and
+	// closing clients -- before we return and the process exits.
+	model.Cancel()
+	racesDone := make(chan struct{})
+	go func() {
+		model.Races.Wait()
+		close(racesDone)
+	}()
+	select {
+	case <-racesDone:
+	case <-time.After(5 * time.Second):
+		logger.Warn("timed out waiting for in-flight races to stop during shutdown")
+	}
+
+	if runErr != nil {
+		// A signal-driven shutdown (Ctrl-C / SIGTERM) surfaces as
+		// ErrProgramKilled or ErrInterrupted; that is a clean exit, not a failure.
+		if errors.Is(runErr, tea.ErrProgramKilled) || errors.Is(runErr, tea.ErrInterrupted) || ctx.Err() != nil {
+			return nil
+		}
+		return runErr
 	}
 
 	return nil

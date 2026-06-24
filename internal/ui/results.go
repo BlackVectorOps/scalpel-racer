@@ -62,8 +62,11 @@ func (m ResultsModel) Update(msg tea.Msg) (ResultsModel, tea.Cmd) {
 	case models.ScanResult:
 		m.Results = append(m.Results, msg)
 		if len(m.Results) == 1 {
-			m.Baseline = &m.Results[0]
-			m.Suspect = &m.Results[0]
+			// Store copies, not pointers into m.Results: append() reallocates the
+			// slice and would leave these dangling at a stale backing array.
+			b, s := m.Results[0], m.Results[0]
+			m.Baseline = &b
+			m.Suspect = &s
 		}
 		m.refreshTable()
 
@@ -149,7 +152,10 @@ func (m *ResultsModel) updateDiff() {
 func (m *ResultsModel) selectedResult() *models.ScanResult {
 	idx := m.Table.Cursor()
 	if idx >= 0 && idx < len(m.FilteredRes) {
-		return &m.FilteredRes[idx]
+		// Return a copy: FilteredRes is rebuilt on every refreshTable, so a
+		// pointer into it would dangle at a stale element.
+		r := m.FilteredRes[idx]
+		return &r
 	}
 	return nil
 }

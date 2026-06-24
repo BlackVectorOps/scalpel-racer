@@ -65,6 +65,8 @@ func (c *h3ClientImpl) Do(ctx context.Context, req *http.Request) (*http.Respons
 }
 
 func (c *h3ClientImpl) Close() error {
-	c.transport.CloseIdleConnections()
-	return nil
+	// Close() (not just CloseIdleConnections) releases the transport's UDP
+	// socket and its packet-reader goroutine; otherwise every client created
+	// during a race leaks a file descriptor and a goroutine.
+	return c.transport.Close()
 }

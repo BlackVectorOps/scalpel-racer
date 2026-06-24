@@ -83,13 +83,23 @@ func (cm *CertManager) GetCA() tls.Certificate {
 	return cm.ca
 }
 
+// certStillValid reports whether a cached leaf is safely inside its validity
+// window (with a small skew margin), so GetOrCreate never serves an expired cert.
+func certStillValid(c *tls.Certificate) bool {
+	if c == nil || c.Leaf == nil {
+		return false
+	}
+	now := time.Now()
+	return now.After(c.Leaf.NotBefore) && now.Before(c.Leaf.NotAfter.Add(-time.Minute))
+}
+
 // GetOrCreate retrieves or generates a certificate for a specific host.
 func (cm *CertManager) GetOrCreate(host string) (*tls.Certificate, error) {
 	cm.mu.RLock()
 	leaf, hit := cm.certCache[host]
 	cm.mu.RUnlock()
 
-	if hit {
+	if hit && certStillValid(leaf) {
 		return leaf, nil
 	}
 
@@ -97,7 +107,7 @@ func (cm *CertManager) GetOrCreate(host string) (*tls.Certificate, error) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	if leaf, hit := cm.certCache[host]; hit {
+	if leaf, hit := cm.certCache[host]; hit && certStillValid(leaf) {
 		return leaf, nil
 	}
 
@@ -222,8 +232,12 @@ func GenerateLeafCert(ca tls.Certificate, caCert *x509.Certificate, serverKey *e
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	// FIX: Handle IPv6 literals (e.g. "[::1]") by stripping brackets
-	host = strings.Trim(host, "[]")
+	// Handle IPv6 literals (e.g. "[::1]") by peeling a single matched bracket
+	// pair -- not strings.Trim, which would also strip stray brackets from an
+	// otherwise-normal hostname.
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
 
 	var ipAddrs []net.IP
 	var dnsNames []string
@@ -234,7 +248,10 @@ func GenerateLeafCert(ca tls.Certificate, caCert *x509.Certificate, serverKey *e
 	}
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate serial number: %w", err)
+	}
 
 	template := x509.Certificate{
 		SerialNumber:   serialNumber,

@@ -37,8 +37,17 @@ func NewQuicListener(port int, pipeline *IngestionPipeline, cm *CertManager, cli
 func (q *QuicListener) Start() error {
 	q.Server = &http3.Server{
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{q.CertManager.GetCA()},
-			NextProtos:   []string{"h3"},
+			// Mint a per-host leaf certificate from the CA for each handshake,
+			// keyed on SNI -- mirroring the TCP listener's GetOrCreate. Presenting
+			// the CA certificate itself (IsCA, no SAN, no ServerAuth EKU) made
+			// every h3 client reject the connection.
+			GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				if hello.ServerName == "" {
+					return nil, fmt.Errorf("h3: missing SNI server name")
+				}
+				return q.CertManager.GetOrCreate(hello.ServerName)
+			},
+			NextProtos: []string{"h3"},
 		},
 		Handler: http.HandlerFunc(q.handle),
 		QUICConfig: &quic.Config{
@@ -77,6 +86,7 @@ func (q *QuicListener) handle(w http.ResponseWriter, r *http.Request) {
 	captureBuf, proxyReq := CaptureWrap(r)
 	proxyReq2 := PrepareProxyRequest(proxyReq)
 	proxyReq2.Body = proxyReq.Body
+	proxyReq2.ContentLength = r.ContentLength // preserve framing (else re-sent chunked)
 
 	resp, err := q.UpstreamClient.Do(proxyReq2)
 
@@ -95,7 +105,9 @@ func (q *QuicListener) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		q.Logger.Debug("h3 response copy error", zap.Error(err))
+	}
 }
 
 func (q *QuicListener) Close() {

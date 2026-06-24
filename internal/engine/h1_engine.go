@@ -61,6 +61,19 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 		go func(idx int) {
 			defer wg.Done()
 
+			// Vote on every barrier this worker never reaches, so a worker that
+			// fails early (client init, connect, a send error, or cancellation)
+			// still lets WaitReady reach its target instead of hanging the burst.
+			// Workers touch barriers in order; nextBarrier is the next one not yet
+			// voted. Await() increments the count itself, so nextBarrier is advanced
+			// just before each Await and this defer covers the remainder.
+			nextBarrier := 0
+			defer func() {
+				for s := nextBarrier; s < len(intermediateBarriers); s++ {
+					intermediateBarriers[s].Arrive()
+				}
+			}()
+
 			// Pin thread for the duration of the race
 			runtime.LockOSThread()
 			defer runtime.UnlockOSThread()
@@ -94,6 +107,7 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 				}
 
 				if !isFinalStage {
+					nextBarrier = step + 1
 					b := intermediateBarriers[step]
 					if err := b.Await(raceCtx); err != nil {
 						results <- models.NewScanResult(idx, 0, 0, nil, err)
@@ -125,7 +139,12 @@ func (r *Racer) RunH1Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 	// Orchestration: Release barriers sequentially
 	for _, b := range intermediateBarriers {
 		if err := b.WaitReady(raceCtx); err != nil {
+			// Alignment failed (context timed out). Cancel so any still-spinning
+			// workers fall out of Await, then wait for all of them before the
+			// deferred close(results) runs to avoid a send-on-closed panic.
 			r.Logger.Warn("Context cancelled during alignment")
+			cancel()
+			wg.Wait()
 			return err
 		}
 		// Small stabilization sleep between stages

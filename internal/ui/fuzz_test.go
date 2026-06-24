@@ -2,7 +2,10 @@
 package ui
 
 import (
+	"bytes"
 	"net"
+	"strconv"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
@@ -24,11 +27,22 @@ func FuzzTextToRequest(f *testing.F) {
 		}
 
 		// Execution
-		_, err := textToRequest(text, original)
+		parsed, err := textToRequest(text, original)
 
-		// We accept errors (invalid input is expected), but we DO NOT accept panics.
+		// Errors on invalid input are fine; a successful parse must hold the
+		// type's invariants (not merely "didn't panic").
 		if err != nil {
 			return
+		}
+		if parsed.Headers == nil {
+			t.Fatal("parsed.Headers must be non-nil on success")
+		}
+		// TextToRequest normalizes Content-Length to the actual body length.
+		if cl, ok := parsed.Headers["Content-Length"]; ok {
+			n, perr := strconv.Atoi(cl)
+			if perr != nil || n != len(parsed.Body) {
+				t.Errorf("Content-Length %q != body length %d", cl, len(parsed.Body))
+			}
 		}
 	})
 }
@@ -84,7 +98,16 @@ func FuzzResolveTarget(f *testing.F) {
 		r := &fuzzResolver{}
 
 		// Execution - Should not panic despite garbage input
-		resolveTargetIPAndPort(req, r)
+		ip, port := resolveTargetIPAndPort(req, r)
+
+		// Invariants: a returned IP must be a real IP, and the "no target"
+		// result is exactly ("", 0).
+		if ip != "" && net.ParseIP(ip) == nil {
+			t.Errorf("returned non-empty but unparseable IP %q", ip)
+		}
+		if ip == "" && port != 0 {
+			t.Errorf("empty IP must pair with port 0, got port %d", port)
+		}
 	})
 }
 
@@ -112,19 +135,31 @@ func FuzzRequestRoundTrip(f *testing.F) {
 		// 2. Serialize
 		txt := requestToText(req)
 
-		// 3. Deserialize
-		// We pass the original request as context to mimic the UI's editing behavior
+		// 3. Deserialize (original passed as context, mimicking the editor).
 		parsed, err := textToRequest(txt, req)
+		if err != nil {
+			return // malformed request lines are allowed to error
+		}
 
-		// We don't assert err == nil because the fuzzer might generate invalid HTTP methods (e.g., with newlines)
-		// which requestToText writes but textToRequest correctly rejects.
-		// We primarily care that this process never PANICS.
-
-		if err == nil {
-			if len(parsed.Body) != len(req.Body) {
-				// While lengths usually match, Content-Length logic might adjust it.
-				// This is just a sanity check point for debugging.
-			}
+		// The request line is whitespace-split on re-parse, and a newline in a
+		// header would shift the header/body boundary, so the round-trip is only
+		// well-defined for whitespace-clean request-line tokens and newline-free
+		// headers. Within that domain method, protocol, and body survive verbatim.
+		if method == "" || url == "" || proto == "" ||
+			strings.ContainsAny(method, " \t\r\n") ||
+			strings.ContainsAny(url, " \t\r\n") ||
+			strings.ContainsAny(proto, " \t\r\n") ||
+			strings.ContainsAny(hKey, "\r\n") || strings.ContainsAny(hVal, "\r\n") {
+			return
+		}
+		if parsed.Method != req.Method {
+			t.Errorf("method round-trip: got %q want %q", parsed.Method, req.Method)
+		}
+		if parsed.Protocol != req.Protocol {
+			t.Errorf("protocol round-trip: got %q want %q", parsed.Protocol, req.Protocol)
+		}
+		if !bytes.Equal(parsed.Body, req.Body) {
+			t.Errorf("body round-trip: got %q want %q", parsed.Body, req.Body)
 		}
 	})
 }
@@ -139,4 +174,3 @@ func (f *fuzzResolver) LookupIP(host string) ([]net.IP, error) {
 	// This helps fuzz the logic that runs AFTER a successful DNS lookup.
 	return []net.IP{net.ParseIP("127.0.0.1")}, nil
 }
-

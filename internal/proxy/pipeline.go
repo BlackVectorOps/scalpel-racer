@@ -38,21 +38,20 @@ func (p *IngestionPipeline) PersistCapture(req *http.Request, body []byte) {
 		logURL.RawQuery = "REDACTED"
 	}
 
-	p.mu.RLock()
-	if p.closed {
-		p.mu.RUnlock()
-		return
-	}
-	p.mu.RUnlock()
-
 	// Offload logic
 	var offloadPath string
 	if len(body) > config.BodyOffloadThreshold {
 		if f, err := os.CreateTemp("", "scalpel-body-*"); err == nil {
-			f.Write(body)
-			f.Close()
-			offloadPath = f.Name()
-			body = nil // Free RAM
+			_, werr := f.Write(body)
+			cerr := f.Close()
+			if werr == nil && cerr == nil {
+				offloadPath = f.Name()
+				body = nil // Free RAM; the body now lives in the offload file
+			} else {
+				// Offload failed (e.g. ENOSPC). Drop the partial file and keep
+				// the in-memory body so the capture isn't silently truncated.
+				os.Remove(f.Name())
+			}
 		}
 	}
 
@@ -70,7 +69,16 @@ func (p *IngestionPipeline) PersistCapture(req *http.Request, body []byte) {
 		OffloadPath: offloadPath,
 	}
 
-	// Non-blocking send
+	// Hold the read lock across the closed-check and the (non-blocking) send.
+	// Close() takes the write lock before it closes CaptureChan, so it cannot
+	// close the channel between this check and the send -- which would otherwise
+	// panic with "send on closed channel". The send is non-blocking, so holding
+	// the lock cannot deadlock Close().
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return
+	}
 	select {
 	case p.CaptureChan <- captured:
 		p.Logger.Info("Captured request", zap.String("url", logURL.String()))
@@ -120,16 +128,42 @@ type StartTeeReadCloser struct {
 	io.Closer
 }
 
+// CaptureBuffer is a goroutine-safe byte buffer for request capture. With HTTP/2
+// or HTTP/3 upstreams the transport keeps writing the tee'd request body from a
+// separate goroutine after Do() returns, while the caller reads the capture via
+// Bytes(); a plain bytes.Buffer would race (and can corrupt or panic) there.
+type CaptureBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *CaptureBuffer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+// Bytes returns a copy of the captured bytes, so the caller never aliases the
+// buffer while a concurrent tee write may still be in flight.
+func (c *CaptureBuffer) Bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.buf.Bytes()
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
 // CaptureWrap creates a TeeReader to capture the body while streaming upstream
-func CaptureWrap(req *http.Request) (*bytes.Buffer, *http.Request) {
-	var captureBuf bytes.Buffer
-	limitWriter := LimitWriter(&captureBuf, config.MaxCaptureSize)
+func CaptureWrap(req *http.Request) (*CaptureBuffer, *http.Request) {
+	captureBuf := &CaptureBuffer{}
+	limitWriter := LimitWriter(captureBuf, config.MaxCaptureSize)
 	proxyBody := &StartTeeReadCloser{
 		Reader: io.TeeReader(req.Body, limitWriter),
 		Closer: req.Body,
 	}
 	req.Body = proxyBody
-	return &captureBuf, req
+	return captureBuf, req
 }
 
 // PrepareProxyRequest clones and sanitizes a request for upstream forwarding

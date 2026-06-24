@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"sync"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -58,6 +59,7 @@ type Model struct {
 	// Runtime
 	Ctx    context.Context
 	Cancel context.CancelFunc
+	Races  *sync.WaitGroup // tracks in-flight race goroutines for graceful shutdown
 	Width  int
 	Height int
 }
@@ -84,6 +86,7 @@ func NewModel(logger *zap.Logger, racer *engine.Racer) Model {
 
 		Ctx:    ctx,
 		Cancel: cancel,
+		Races:  &sync.WaitGroup{},
 	}
 }
 
@@ -163,7 +166,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err == nil {
 					m.State = StateRunning
 					m.Results = NewResultsModel() // Reset results
-					m.Results.Update(tea.WindowSizeMsg{Width: m.Width, Height: m.Height})
+					// ResultsModel.Update has a value receiver, so the computed
+					// layout (table/diff sizes) is only kept if we capture it.
+					m.Results, _ = m.Results.Update(tea.WindowSizeMsg{Width: m.Width, Height: m.Height})
 					return m, m.StartRace(req)
 				}
 			}
@@ -219,7 +224,9 @@ func (m *Model) StartRace(req *models.CapturedRequest) tea.Cmd {
 	ch := make(chan models.ScanResult, m.Concurrency+1)
 	targetIP, port := ResolveTargetIPAndPort(req, m.Resolver)
 
+	m.Races.Add(1)
 	go func() {
+		defer m.Races.Done()
 		ctx, cancel := context.WithTimeout(m.Ctx, config.RaceTimeout)
 		defer cancel()
 

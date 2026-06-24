@@ -94,10 +94,9 @@ func (r *Racer) RunH2Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 
 	for i, h := range handles {
 		if h == nil {
-			// Vote but do not spin worker to prevent deadlock
-			go func() {
-				gate.Await(raceCtx)
-			}()
+			// Vote so the barrier still reaches its target, but don't spin a
+			// worker goroutine (there is nothing to release for a failed handle).
+			gate.Arrive()
 			continue
 		}
 		wg.Add(1)
@@ -134,6 +133,10 @@ func (r *Racer) RunH2Race(ctx context.Context, reqSpec *models.CapturedRequest, 
 	}
 
 	if err := gate.WaitReady(raceCtx); err != nil {
+		// Unblock any spinning workers and wait for them before the deferred
+		// close(results) runs, so no worker can send on a closed channel.
+		cancel()
+		wg.Wait()
 		return err
 	}
 

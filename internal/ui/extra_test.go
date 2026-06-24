@@ -97,11 +97,37 @@ func TestUI_ResultsView(t *testing.T) {
 		}
 
 		m.Results.Table.SetCursor(2)
-		m, _ = update(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+		m, _ = update(m, tea.KeyMsg{Type: tea.KeyEnter}) // Suspect is bound to "enter", not 's'
 		if m.Results.Suspect == nil || m.Results.Suspect.Index != 2 {
-			// t.Error("Suspect not set correctly")
+			t.Errorf("Suspect not set correctly: %+v", m.Results.Suspect)
 		}
 	})
+}
+
+func TestUI_ResultsLayoutAppliedOnAttack(t *testing.T) {
+	logger := zap.NewNop()
+	racer := engine.NewRacer(&MockFactory{}, logger)
+	m := NewModel(logger, racer)
+	defer m.Cancel() // stop the race goroutine StartRace launches
+
+	// Establish a viewport size.
+	m, _ = update(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	// Enter the editor with a valid request and launch the attack (ctrl+s).
+	m.State = StateEditing
+	m.Dashboard.SelectedReq = &models.CapturedRequest{}
+	m.Editor = NewEditorModel()
+	m.Editor.SetValue("GET http://example.com HTTP/1.1\nHost: example.com\n\n")
+	m, _ = update(m, tea.KeyMsg{Type: tea.KeyCtrlS})
+
+	if m.State != StateRunning {
+		t.Fatalf("expected StateRunning after launching attack, got %v", m.State)
+	}
+	// The freshly-created ResultsModel must receive the window size, not be left
+	// at zero (which renders the results/diff panes at zero size).
+	if m.Results.Width != 120 {
+		t.Errorf("Results.Width = %d, want 120 (layout not applied)", m.Results.Width)
+	}
 }
 
 func TestUI_ErrorHandling(t *testing.T) {
@@ -134,6 +160,15 @@ func TestUI_ErrorHandling(t *testing.T) {
 			t.Error("Should remain in editing state on parse error")
 		}
 	})
+}
+
+func TestDashboard_BodyLoadedNilSelectedReqNoPanic(t *testing.T) {
+	d := NewDashboardModel(NewRequestHistory(10, zap.NewNop()))
+	// SelectedReq is nil; a successful BodyLoadedMsg must not dereference it.
+	d, _ = d.Update(BodyLoadedMsg{Content: []byte("data")})
+	if d.SelectedReq != nil {
+		t.Error("SelectedReq should remain nil")
+	}
 }
 
 func TestUI_View(t *testing.T) {
@@ -212,6 +247,27 @@ func (mr *MockResolver) LookupIP(host string) ([]net.IP, error) {
 }
 
 func Test_resolveTargetIPAndPort(t *testing.T) {
-	// ... (Existing test cases assumed correct)
-	// Just ensuring resolveTargetIPAndPort exists via helpers.go
+	res := &MockResolver{} // resolves only example.com -> 93.184.216.34
+	cases := []struct {
+		name     string
+		req      *models.CapturedRequest
+		wantIP   string
+		wantPort int
+	}{
+		{"http default port", &models.CapturedRequest{URL: "http://example.com"}, "93.184.216.34", 80},
+		{"https default port", &models.CapturedRequest{URL: "https://example.com"}, "93.184.216.34", 443},
+		{"explicit url port", &models.CapturedRequest{URL: "http://example.com:8443"}, "93.184.216.34", 8443},
+		{"host header port", &models.CapturedRequest{URL: "http://example.com", Headers: map[string]string{"Host": "example.com:9000"}}, "93.184.216.34", 9000},
+		{"host header drives lookup", &models.CapturedRequest{URL: "http://ignored.invalid", Headers: map[string]string{"Host": "example.com"}}, "93.184.216.34", 80},
+		{"unresolvable host", &models.CapturedRequest{URL: "http://nope.invalid"}, "", 0},
+		{"empty", &models.CapturedRequest{URL: ""}, "", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ip, port := ResolveTargetIPAndPort(tc.req, res)
+			if ip != tc.wantIP || port != tc.wantPort {
+				t.Errorf("got (%q, %d), want (%q, %d)", ip, port, tc.wantIP, tc.wantPort)
+			}
+		})
+	}
 }

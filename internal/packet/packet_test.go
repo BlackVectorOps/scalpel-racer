@@ -55,6 +55,56 @@ func (m *MockQueue) SetVerdict(id uint32, verdict int) error {
 
 func (m *MockQueue) Close() {}
 
+// orderQueue records how many verdicts were set by the time Close() is called,
+// so a test can verify Close() drains the burst-release goroutine before
+// closing the netlink socket those verdicts are written to.
+type orderQueue struct {
+	mu              sync.Mutex
+	verdicts        int
+	verdictsAtClose int
+	closed          bool
+}
+
+func (q *orderQueue) RegisterWithErrorFunc(ctx context.Context, fn nfqueue.HookFunc, errFn nfqueue.ErrorFunc) error {
+	return nil
+}
+func (q *orderQueue) SetVerdict(id uint32, verdict int) error {
+	time.Sleep(3 * time.Millisecond) // make the release/close race observable
+	q.mu.Lock()
+	q.verdicts++
+	q.mu.Unlock()
+	return nil
+}
+func (q *orderQueue) Close() {
+	q.mu.Lock()
+	q.verdictsAtClose = q.verdicts
+	q.closed = true
+	q.mu.Unlock()
+}
+
+func TestController_CloseDrainsVerdictsBeforeClosingQueue(t *testing.T) {
+	// Avoid running real iptables in Close() -> cleanupRules().
+	orig := execCommand
+	execCommand = mockExecCommand
+	defer func() { execCommand = orig }()
+
+	mq := &orderQueue{}
+	c := NewController("1.2.3.4", 80, 1, zap.NewNop())
+	c.nfq = mq
+	c.heldIDs = []uint32{1, 2, 3, 4, 5}
+
+	c.Close()
+
+	mq.mu.Lock()
+	defer mq.mu.Unlock()
+	if !mq.closed {
+		t.Fatal("nfq.Close was not called")
+	}
+	if mq.verdictsAtClose != 5 {
+		t.Errorf("nfq closed with %d/5 verdicts set -- use-after-close race", mq.verdictsAtClose)
+	}
+}
+
 // mockExecCommand simulates exec.Command behaviors for tests
 func mockExecCommand(command string, args ...string) *exec.Cmd {
 	cs := []string{"-test.run=TestHelperProcess", "--", command}

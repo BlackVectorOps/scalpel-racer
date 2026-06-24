@@ -67,6 +67,7 @@ type Controller struct {
 	closed      bool
 
 	flushTimer *time.Timer
+	releaseWg  sync.WaitGroup
 }
 
 func NewController(ip string, port int, concurrency int, logger *zap.Logger) *Controller {
@@ -125,6 +126,11 @@ func (c *Controller) Start(ctx context.Context) error {
 				c.Logger.Error("Panic in NFQUEUE callback",
 					zap.Any("panic", r),
 					zap.String("stack", string(debug.Stack())))
+				// Don't orphan the held packet on a recovered panic: accept it
+				// so the target's traffic isn't wedged in the kernel queue.
+				if a.PacketID != nil {
+					_ = c.nfq.SetVerdict(*a.PacketID, nfqueue.NfAccept)
+				}
 			}
 		}()
 
@@ -268,7 +274,9 @@ func (c *Controller) triggerReleaseLocked() {
 	idsToRelease := make([]uint32, len(c.heldIDs))
 	copy(idsToRelease, c.heldIDs)
 
+	c.releaseWg.Add(1)
 	go func(ids []uint32) {
+		defer c.releaseWg.Done()
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
@@ -304,6 +312,10 @@ func (c *Controller) Close() {
 	}
 	c.triggerReleaseLocked()
 	c.mu.Unlock()
+
+	// Wait for the burst-release goroutine(s) to finish writing verdicts before
+	// closing the netlink socket they use (avoids a use-after-close data race).
+	c.releaseWg.Wait()
 
 	if c.nfq != nil {
 		c.nfq.Close()
