@@ -39,32 +39,42 @@ func PlanH1Attack(reqSpec *models.CapturedRequest) (*RacePlan, error) {
 		return nil, err
 	}
 
-	// 3. Logic: Serialize Header-Only to Wire Format
-	// Optimization: We manually set ContentLength and provide NoBody to serialization.
-	// This gives us the wire-formatted headers. We then append the body chunks manually.
-	// This avoids allocating a buffer size of (Headers + Body) just to slice it up again.
-	headerBytes, err := customhttp.SerializeRequest(req)
+	// 3. Serialize the full request to wire format. SerializeRequest emits the
+	// headers AND body framed with a correct Content-Length (= len(cleanBody)).
+	serialized, err := customhttp.SerializeRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("serialization failed: %w", err)
 	}
 
-	// 4. Logic: Map Stages
-	// We append the first body chunk to the headers to form the first stage.
-	wireStages := make([][]byte, len(bodyChunks))
+	// 4. Map stages.
+	var wireStages [][]byte
+	if len(bodyChunks) <= 1 || len(cleanBody) == 0 {
+		// No {{SYNC}} markers (or no body): send the whole, correctly-framed
+		// request as a single stage. No intermediate barriers are created.
+		wireStages = [][]byte{serialized}
+	} else {
+		// Staged attack: keep the serialized header block, then stream the real
+		// body split at the markers. The chunks sum to cleanBody, so the
+		// Content-Length declared in the headers stays correct. Splitting at the
+		// first blank line is safe: header values cannot contain a blank line.
+		sep := []byte("\r\n\r\n")
+		hdrEnd := bytes.Index(serialized, sep)
+		if hdrEnd < 0 {
+			return nil, fmt.Errorf("serialized request missing header terminator")
+		}
+		headerBytes := serialized[:hdrEnd+len(sep)]
 
-	// Stage 0: Headers + Chunk 0
-	wireStages[0] = append(headerBytes, bodyChunks[0]...)
-
-	// Subsequent Stages: Chunk N
-	for i := 1; i < len(bodyChunks); i++ {
-		wireStages[i] = bodyChunks[i]
+		wireStages = make([][]byte, len(bodyChunks))
+		// Stage 0: Headers + Chunk 0 (copied so we don't alias the serialized buffer).
+		wireStages[0] = append(append([]byte{}, headerBytes...), bodyChunks[0]...)
+		// Subsequent Stages: Chunk N
+		for i := 1; i < len(bodyChunks); i++ {
+			wireStages[i] = bodyChunks[i]
+		}
 	}
 
-	// Re-attach the full body to the request object for the caller (logic layer),
-	// even though we used a NoBody request for the wire serialization.
-	req.Body = http.NoBody
-	// Note: We leave req.Body as NoBody or reset it if needed by caller.
-	// We recreate the CleanRequest for higher-level logic that expects a readable body.
+	// Rebuild a fresh CleanRequest with a readable body for higher-level logic
+	// (the request used for serialization had its body consumed during reads).
 	req, _ = http.NewRequest(req.Method, req.URL.String(), bytes.NewReader(cleanBody))
 	req.ContentLength = int64(len(cleanBody))
 	for k, v := range reqSpec.Headers {
@@ -95,9 +105,11 @@ func constructCleanRequest(reqSpec *models.CapturedRequest, bodyChunks [][]byte)
 	cleanBody := bytes.Join(bodyChunks, []byte{})
 	totalLen := int64(len(cleanBody))
 
-	// Create request with NoBody to prevent SerializeRequest from consuming a reader
-	// or allocating memory for the body.
-	req, err := http.NewRequest(method, reqSpec.URL, http.NoBody)
+	// Build the request with the real (marker-stripped) body so SerializeRequest
+	// frames it with a correct Content-Length. Passing http.NoBody here makes
+	// SerializeRequest read an empty body and reset Content-Length to 0, which
+	// yields a self-terminating request whose later-appended body is smuggled.
+	req, err := http.NewRequest(method, reqSpec.URL, bytes.NewReader(cleanBody))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
