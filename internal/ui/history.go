@@ -131,6 +131,13 @@ func (h *RequestHistory) List() []*models.CapturedRequest {
 	return out
 }
 
+// Size returns the number of stored requests, guarded by the history lock.
+func (h *RequestHistory) Size() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.size
+}
+
 // Close cleans up all temporary files created during the session.
 func (h *RequestHistory) Close() {
 	h.mu.Lock()

@@ -162,6 +162,15 @@ func TestUI_ErrorHandling(t *testing.T) {
 	})
 }
 
+func TestDashboard_BodyLoadedNilSelectedReqNoPanic(t *testing.T) {
+	d := NewDashboardModel(NewRequestHistory(10, zap.NewNop()))
+	// SelectedReq is nil; a successful BodyLoadedMsg must not dereference it.
+	d, _ = d.Update(BodyLoadedMsg{Content: []byte("data")})
+	if d.SelectedReq != nil {
+		t.Error("SelectedReq should remain nil")
+	}
+}
+
 func TestUI_View(t *testing.T) {
 	logger := zap.NewNop()
 	racer := engine.NewRacer(&MockFactory{}, logger)
