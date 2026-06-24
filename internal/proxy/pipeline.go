@@ -42,10 +42,16 @@ func (p *IngestionPipeline) PersistCapture(req *http.Request, body []byte) {
 	var offloadPath string
 	if len(body) > config.BodyOffloadThreshold {
 		if f, err := os.CreateTemp("", "scalpel-body-*"); err == nil {
-			f.Write(body)
-			f.Close()
-			offloadPath = f.Name()
-			body = nil // Free RAM
+			_, werr := f.Write(body)
+			cerr := f.Close()
+			if werr == nil && cerr == nil {
+				offloadPath = f.Name()
+				body = nil // Free RAM; the body now lives in the offload file
+			} else {
+				// Offload failed (e.g. ENOSPC). Drop the partial file and keep
+				// the in-memory body so the capture isn't silently truncated.
+				os.Remove(f.Name())
+			}
 		}
 	}
 
