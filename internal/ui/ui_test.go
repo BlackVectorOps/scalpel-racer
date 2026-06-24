@@ -234,6 +234,35 @@ func TestHistory_RingBuffer(t *testing.T) {
 	}
 }
 
+func TestHistory_CleansAdoptedAndEvictedFiles(t *testing.T) {
+	h := NewRequestHistory(2, zap.NewNop())
+
+	// A pipeline-offloaded request: Body already nil, OffloadPath set.
+	f, err := os.CreateTemp("", "scalpel-adopt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	h.Add(&models.CapturedRequest{Method: "POST", OffloadPath: f.Name()})
+
+	// Evict it from the size-2 ring with two more (large-body) entries.
+	big := make([]byte, BodyOffloadThreshold+1)
+	h.Add(&models.CapturedRequest{Method: "A", Body: big})
+	h.Add(&models.CapturedRequest{Method: "B", Body: big})
+
+	if _, err := os.Stat(f.Name()); err != nil {
+		t.Fatalf("adopted file should still exist before Close: %v", err)
+	}
+
+	h.Close()
+
+	// The first request was evicted from the ring, but Close must still remove
+	// its offload file (tracked separately, not just iterated from the buffer).
+	if _, err := os.Stat(f.Name()); !os.IsNotExist(err) {
+		t.Errorf("adopted offload file leaked after eviction + Close: %v", err)
+	}
+}
+
 func TestRequestToText(t *testing.T) {
 	req := &models.CapturedRequest{
 		Method:   "GET",

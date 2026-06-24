@@ -21,12 +21,13 @@ type StoredRequest struct {
 }
 
 type RequestHistory struct {
-	buffer []*StoredRequest
-	head   int
-	size   int
-	limit  int
-	logger *zap.Logger
-	mu     sync.RWMutex
+	buffer    []*StoredRequest
+	head      int
+	size      int
+	limit     int
+	logger    *zap.Logger
+	tempFiles []string // every offload path, removed on Close (survives ring eviction)
+	mu        sync.RWMutex
 }
 
 func NewRequestHistory(limit int, logger *zap.Logger) *RequestHistory {
@@ -45,8 +46,13 @@ func (h *RequestHistory) Add(req *models.CapturedRequest) {
 
 	stored := &StoredRequest{Req: req}
 
-	// Offload to disk if body is large
-	if len(req.Body) > BodyOffloadThreshold {
+	if req.OffloadPath != "" {
+		// An upstream stage (the proxy ingestion pipeline) already offloaded this
+		// body. Adopt the file for cleanup; the size-based branch can't catch it
+		// because Body is already nil.
+		stored.OnDisk = true
+		h.tempFiles = append(h.tempFiles, req.OffloadPath)
+	} else if len(req.Body) > BodyOffloadThreshold {
 		// Use os.CreateTemp for safe temporary file creation
 		tmpfile, err := os.CreateTemp("", "scalpel-body-*.bin")
 		if err != nil {
@@ -68,6 +74,7 @@ func (h *RequestHistory) Add(req *models.CapturedRequest) {
 				req.OffloadPath = tmpfile.Name()
 				req.Body = nil // Clear from memory to free RAM
 				stored.OnDisk = true
+				h.tempFiles = append(h.tempFiles, tmpfile.Name())
 			}
 		}
 	}
@@ -129,13 +136,13 @@ func (h *RequestHistory) Close() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.logger.Info("Cleaning up temporary files...")
-	// We iterate the entire buffer, not just the active size, just in case
-	// artifacts remain.
-	for _, item := range h.buffer {
-		if item != nil && item.OnDisk && item.Req.OffloadPath != "" {
-			_ = os.Remove(item.Req.OffloadPath)
-		}
+	h.logger.Info("Cleaning up temporary files...", zap.Int("count", len(h.tempFiles)))
+	// Remove every offload file we created or adopted. Paths are tracked
+	// separately so they survive ring-buffer eviction -- iterating only the live
+	// buffer would leak the files of evicted entries.
+	for _, path := range h.tempFiles {
+		_ = os.Remove(path)
 	}
+	h.tempFiles = nil
 	runtime.GC()
 }
