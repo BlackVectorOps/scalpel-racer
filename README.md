@@ -9,38 +9,36 @@
 
 # Scalpel Racer
 
-> **A high-precision race condition exploitation framework.**
+> **A high-precision race-condition testing framework.**
 
-![Go Version](https://img.shields.io/badge/go-1.18%2B-blue)
-![Strategies](https://img.shields.io/badge/strategies-SPA%20%7C%20First--Seq%20%7C%20Sync-orange)
+![Go Version](https://img.shields.io/badge/go-1.25%2B-blue)
+![Strategies](https://img.shields.io/badge/strategies-h1%20%7C%20h2%20%7C%20h3-orange)
 ![Status](https://img.shields.io/badge/status-active-green)
 
-Scalpel Racer is an advanced testing tool designed to identify and exploit race conditions in web applications with **microsecond precision**. Unlike standard tools, it bypasses network jitter using low-level packet manipulation strategies.
+Scalpel Racer finds and exploits race conditions in web applications by firing tightly-synchronized bursts of requests. It pairs an intercepting proxy (to capture traffic straight from your browser) with an interactive TUI and three timing strategies that squeeze out network jitter — down to kernel-level packet bunching on Linux.
 
 ---
 
 ## Why Scalpel Racer?
 
-*   **Single Packet Attack (SPA):** Squeezes 20+ requests into a single TCP packet for maximum simultaneity.
-*   **First-Sequence Sync:** (Linux only) Kernel-level packet bunching using `NetfilterQueue` for the ultimate race window.
-*   **Built-in Interception:** Includes a full HTTP/1.1 & HTTP/2 proxy to capture requests directly from your browser.
-*   **Rich Analytics:** Visualize response distribution, timing jitter, and body hashes in real-time.
+*   **Single-Packet Attack (H2):** Pre-sends every request's headers, then releases all the final `DATA` frames together — so the requests land in one window, not strung across the network.
+*   **First-Sequence Sync (Linux):** Holds outbound packets in a `NetfilterQueue` and releases them as one burst for the tightest race window.
+*   **Built-in interception:** HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) proxy with on-the-fly CA generation for HTTPS.
+*   **Live analytics:** Groups responses by status code and body hash so an out-of-band result stands out immediately.
 
-## Key Features
+## Strategies
 
-| Feature | Description |
-| :--- | :--- |
-| **Concurrency** | Send massive bursts of requests simultaneously. |
-| **Strategies** | **Auto** (httpx), **SPA** (H2 Frames), **First-Seq** (Kernel Sync). |
-| **Traffic Capture** | Built-in proxy (TCP & HTTP/3 aware) for easy workflow integration. |
-| **Request Editing** | Modify bodies and inject `{{SYNC}}` markers for Staged attacks. |
-| **HTTPS Support** | Dynamic CA generation for seamless HTTPS interception. |
-| **Analysis** | Automatic grouping of responses by status and content hash. |
+| Strategy | Transport | Technique |
+| :--- | :--- | :--- |
+| **h2** (default) | HTTP/2 | Single-packet attack — hold every stream's final `DATA` frame, release together. |
+| **h1** | HTTP/1.1 | Staged send split at `{{SYNC}}` markers, released on a spin-barrier. |
+| **h3** | HTTP/3 / QUIC | Hold the request body's final byte across streams, release together *(experimental)*. |
+
+On Linux, **h1** and **h2** additionally bunch outbound packets via `NetfilterQueue` (First-Sequence Sync) when the target resolves to an IP — no extra configuration needed.
 
 ## Installation
 
-### 1. Clone & Build
-Scalpel Racer requires **Go 1.18+**.
+Requires **Go 1.25+**.
 
 ```bash
 git clone https://github.com/xkilldash9x/scalpel-racer.git
@@ -48,71 +46,64 @@ cd scalpel-racer
 go build -o scalpel-racer ./cmd/scalpel-racer
 ```
 
-## Usage Guide
+## Usage
 
-### 1. Start the Engine
-Launch the tool. It acts as an interactive CLI and Proxy.
+Scalpel Racer is an interactive TUI plus an intercepting proxy.
+
+### 1. Start it
 
 ```bash
-# Listen on port 8080 (default)
-./scalpel-racer
+./scalpel-racer            # listens on :8080
+./scalpel-racer -p 9090    # custom port
 ```
 
-### 2. Capture Traffic
-Configure your browser (or Burp Suite) to proxy through `127.0.0.1:8080`.
-*   Trigger the request you want to test in your browser.
-*   It will appear in the Scalpel CLI.
+Flags: `-p <port>` listen port (default `8080`) · `-debug` verbose logging to `racer.log`.
 
-### 3. Race!
-Inside the CLI:
+### 2. Capture traffic
 
-*   **`ls`**: List captured requests.
-*   **`race <ID>`**: Launch an attack on request #ID.
-*   **`race <ID> 20`**: Launch with 20 concurrent threads.
+Point your browser (or Burp Suite) at `127.0.0.1:8080` for both HTTP and HTTPS, then trigger the request you want to test. It appears in the capture table.
+
+### 3. Drive the TUI
+
+| Key | Action |
+| :--- | :--- |
+| `↑`/`↓` (or `k`/`j`) | Navigate captures / results |
+| `Enter` | Open the selected request in the editor |
+| `Tab` | Cycle strategy (`h2` → `h1` → `h3`); the current one shows in the header |
+| `Ctrl+S` | Editor: launch the race · Results: save a report |
+| `Esc` | Back |
+| `f` | Results: toggle outliers-only |
+| `b` / `Enter` | Results: set baseline / suspect for diffing |
+| `q` / `Ctrl+C` | Quit |
+
+Bursts run at **20 concurrent requests**.
+
+### Staged attacks (`{{SYNC}}`)
+
+With the **h1** strategy, insert `{{SYNC}}` in the request body to split it into stages, e.g.:
 
 ```text
-vector > ls
-[0] POST https://api.example.com/transfer
-
-vector > race 0 20
-[*] Racing https://api.example.com/transfer (20 threads)...
+param=val&{{SYNC}}final=true
 ```
 
-## Attack Strategies
+Every worker sends up to the marker, waits at the spin-barrier, then releases the remainder together — useful when the decisive state change rides on the last bytes.
 
-### Auto (Default)
-Uses `net/http` with synchronization barriers. Good for general testing.
-*   Supports **Staged Attacks**: Insert `{{SYNC}}` in the body (e.g., `param=val&{{SYNC}}final=true`) to pause requests before the final byte.
+## HTTPS interception
 
-### SPA (Single Packet Attack)
-Uses **HTTP/2** features to pre-send headers and hold the final DATA frame. All requests complete when the final packet arrives, eliminating most network jitter.
+On first run, Scalpel Racer generates a CA under `~/.scalpel-racer/certs/`. Import `ca.pem` into your browser's trusted-root store to avoid certificate warnings. (Firefox keeps its own store, separate from the OS.)
 
 ## Architecture
 
-*   **`cmd/scalpel-racer`**: Command Center & UI.
-*   **`internal/proxy`**: Unified Proxy (TCP/QUIC) Orchestrator.
-*   **`internal/engine`**: Native H1/H2 Proxy Engine.
-*   **`internal/packet`**: Low-level packet manipulation.
+| Package | Responsibility |
+| :--- | :--- |
+| `cmd/scalpel-racer` | Interactive TUI and entry point |
+| `internal/proxy` | Intercepting proxy (TCP H1/H2 + QUIC H3) and dynamic CA |
+| `internal/engine` | Race engines (`h1`/`h2`/`h3`) and the spin-barrier |
+| `internal/packet` | Linux `NetfilterQueue` First-Sequence sync |
 
 ## Troubleshooting
 
-### Common Issues
-
-*   **`permission denied` (when running `./scalpel-racer`)**:
-    *   **Cause**: The binary does not have execute permissions.
-    *   **Fix**: Run `chmod +x ./scalpel-racer`.
-
-*   **`address already in use`**:
-    *   **Cause**: Another process (or a previous instance of Scalpel Racer) is using the specified port.
-    *   **Fix**: Kill the process using `lsof -i :<port>` / `kill <PID>` or use the `-l <port>` argument to listen on a different port.
-
-*   **Browser Warnings / SSL Errors**:
-    *   **Cause**: The browser does not trust the generated CA.
-    *   **Fix**: Import `~/.scalpel-racer/certs/ca.pem` into your browser's Trusted Root Certification Authorities store. Firefox has its own store separate from the OS.
-
-*   **No Requests Captured**:
-    *   **Cause**: The proxy is not configured correctly in your browser/tool, or the `scope` regex is too restrictive.
-    *   **Fix**: Ensure your browser proxy is set to `127.0.0.1:8080` (or your custom port) for both HTTP and HTTPS. Check your `--scope` argument.
-
----
-_Crafted with precision by Project Scalpel Team._
+*   **`permission denied` running `./scalpel-racer`** — the binary lacks the execute bit: `chmod +x ./scalpel-racer`.
+*   **`address already in use`** — another process (or a prior instance) holds the port. Free it (`lsof -i :<port>` then `kill <pid>`) or pick another with `-p <port>`.
+*   **Browser SSL warnings** — import `~/.scalpel-racer/certs/ca.pem` into the trusted-root store (Firefox has its own, separate from the OS).
+*   **No requests captured** — confirm the browser/tool proxy points at `127.0.0.1:8080` (or your `-p` port) for **both** HTTP and HTTPS.
