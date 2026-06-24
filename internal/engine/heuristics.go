@@ -64,8 +64,12 @@ func (r *Racer) ProbeSessionLocking(ctx context.Context, reqA, reqB *models.Capt
 
 	// 2. Variable: Parallel Execution
 	ch := make(chan models.ScanResult, 2)
+	var parErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		_ = r.RunH2Race(ctx, reqA, 2, ch)
+		defer wg.Done()
+		parErr = r.RunH2Race(ctx, reqA, 2, ch)
 	}()
 
 	var maxParallel time.Duration
@@ -73,6 +77,11 @@ func (r *Racer) ProbeSessionLocking(ctx context.Context, reqA, reqB *models.Capt
 		if res.Duration > maxParallel {
 			maxParallel = res.Duration
 		}
+	}
+	wg.Wait()
+	if parErr != nil {
+		// Don't report a bogus "not locked" with negative confidence on failure.
+		return nil, fmt.Errorf("parallel probe failed: %w", parErr)
 	}
 
 	// 3. Heuristic Calculation
